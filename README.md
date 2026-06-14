@@ -69,7 +69,7 @@ wardrobe = get_example_wardrobe()
 ## Tool Inventory
 
 ### `search_listings(description: str, size: str | None, max_price: float | None) → list[dict]`
-Searches `listings.json` for items matching the user's query. Relevance is scored by keyword overlap between `description` and each listing's `title`, `description`, `category`, and `style_tags` fields using whole-word matching to avoid false positives. Optional `size` and `max_price` filters are applied first. Returns a list of up to 3 matching listing dicts sorted by relevance score; returns an empty list if nothing matches, does not raise an exception.
+Searches `listings.json` for items matching the user's query. Relevance is scored by keyword overlap between `description` and each listing's `title`, `description`, `category`, and `style_tags` fields using whole-word matching to avoid false positives. Optional `size` and `max_price` filters are applied first. Returns a list of up to 3 matching listing dicts sorted by relevance score — returns an empty list if nothing matches, does not raise an exception.
 
 ### `suggest_outfit(new_item: dict, wardrobe: dict) → str`
 Takes the top listing from `search_listings` and the user's wardrobe and uses an LLM (`llama-3.3-70b-versatile` via Groq) to generate 1–2 outfit suggestions pairing the new item with existing wardrobe pieces. If the wardrobe is empty, returns general styling advice for the item instead of specific combinations. Returns `'NONE'` if the LLM signals it cannot generate a valid suggestion.
@@ -84,8 +84,8 @@ Takes the styling suggestion from `suggest_outfit` and the top listing dict and 
 The agent runs a sequence of tool calls with conditional branching and retry logic at each step:
 
 1. Parse the user's query using an LLM (`_parse_query`) to extract `description`, `size`, and `max_price`. Exclusive phrasings like "under $30" are converted to 29.99; inclusive phrasings like "$50 or under" keep the number as-is. If the LLM returns malformed JSON, falls back to using the full query as description with no filters.
-2. Call `search_listings`. If results are empty, retry once with relaxed filters (dropping `size` and `max_price`). If still empty, set `session["error"]` and return early; `suggest_outfit` is never called with empty input.
-3. Set `selected_item = results[0]` and call `suggest_outfit`. Since this is LLM-based, retry up to `MAX_ITERATIONS` (3) times if it returns nothing or `'NONE'`. If all attempts fail, set `session["error"]` and return early; `create_fit_card` is never called.
+2. Call `_search_with_fallback` which attempts `search_listings` up to `MAX_SEARCH_FALLBACKS` (4) times with progressively relaxed filters: first with all filters, then with `max_price` relaxed by 20% to stay close to the user's budget, then dropping `max_price` entirely while preserving `size`, and finally dropping both filters as a last resort. The number of fallback attempts is configurable — setting `MAX_SEARCH_FALLBACKS = 1` skips all relaxation. If all attempts return empty, set `session["error"]` and return early — `suggest_outfit` is never called with empty input. If a relaxed search succeeds, `session["search_note"]` is set to inform the user which filters were adjusted.
+3. Set `selected_item = results[0]` and call `suggest_outfit`. Since this is LLM-based, retry up to `MAX_ITERATIONS` (3) times if it returns nothing or `'NONE'`. If all attempts fail, set `session["error"]` and return early — `create_fit_card` is never called.
 4. Call `create_fit_card` with the outfit suggestion and selected item. Also LLM-based — retry up to `MAX_ITERATIONS` (3) times on failure or `'NONE'`. If all attempts fail, surface the outfit suggestion directly and note the fit card could not be generated.
 5. Return the completed session dict.
 
@@ -111,9 +111,16 @@ All values are held in the session dict and passed directly between tool calls. 
 
 | Tool | Failure mode | Agent response | Example from testing |
 |------|-------------|----------------|----------------------|
-| `search_listings` | No results match the query | Retries once with relaxed filters (dropping `size` and `max_price`). If still empty, sets `session["error"]` and returns early — `suggest_outfit` is never called. | Running `search_listings("designer ballgown", size="XXS", max_price=5)` returns `[]`. Full agent run sets `session["error"] = "No listings matched your query. Try broadening your description, adjusting your size, or raising your max price."` and `session["fit_card"] = None`. |
+| `search_listings` | No results match the query | Retries progressively via `_search_with_fallback` up to `MAX_SEARCH_FALLBACKS` (4) times: first relaxing `max_price` by 20%, then dropping `max_price` entirely, then dropping `size` as a last resort. If all attempts return empty, sets `session["error"]` and returns early — `suggest_outfit` is never called. | Running `search_listings("designer ballgown", size="XXS", max_price=5)` returns `[]`. Full agent run sets `session["error"] = "No listings matched your query. Try broadening your description, adjusting your size, or raising your max price."` and `session["fit_card"] = None`. |
 | `suggest_outfit` | Wardrobe is empty | Falls back to general styling advice for the item rather than specific outfit combinations. Agent continues to `create_fit_card`. | Running `suggest_outfit(results[0], get_empty_wardrobe())` returned general styling advice for the Y2K Baby Tee — two outfit ideas with no wardrobe-specific pieces referenced. |
 | `create_fit_card` | Outfit input is empty or missing | Returns a descriptive error message string instead of raising an exception. Agent surfaces the outfit suggestion from `suggest_outfit` directly to the user. | Running `create_fit_card("", results[0])` returned `"Could not generate a fit card — the outfit suggestion was empty. Try resubmitting your query with more details."` |
+
+---
+
+## Stretch Features
+
+**Retry logic with fallback (implemented):**
+If `search_listings` returns no results, the agent automatically retries with progressively relaxed constraints via `_search_with_fallback`. The order is: all filters → relax `max_price` by 20% → drop `max_price` entirely → drop `size` as a last resort. The number of fallback attempts is controlled by `MAX_SEARCH_FALLBACKS` (default 4) — setting it to 1 disables all relaxation, 2 allows only price relaxation, and so on. Size is preserved as long as possible since a great find at the wrong size is not useful. The user is informed via `session["search_note"]` if filters were relaxed, which is surfaced in the listing panel of the UI. This directly implements the retry logic with fallback stretch feature described in the project spec.
 
 ---
 
@@ -129,9 +136,11 @@ The implementation matches the planning.md spec with several notable decisions m
 
 **`NONE` grounding instruction** — a `'NONE'` signal was added to the `suggest_outfit` and `create_fit_card` prompts so the LLM can explicitly signal failure rather than returning unhelpful text that would pass empty/whitespace checks but be useless as output. The agent's retry loops check for `'NONE'` alongside empty strings.
 
-**Defensive coding for external API calls** — following feedback from the previous project about wrapping external calls in error handling, try/except blocks were added around all Groq API calls in suggest_outfit and create_fit_card. A network timeout or rate limit now returns "NONE" rather than crashing the agent, which feeds cleanly into the existing retry loops.
+**Defensive coding for external API calls** — following feedback from the previous project about wrapping external calls in error handling, `try/except` blocks were added around all Groq API calls in `suggest_outfit` and `create_fit_card`, and `FileNotFoundError` and `json.JSONDecodeError` guards were added to `data_loader.py`. A network timeout or rate limit now returns `"NONE"` rather than crashing the agent, and a missing data file returns a descriptive error message rather than an unhandled exception.
 
 **Shared Groq client** — the Groq client was moved to `utils/groq_client.py` to avoid duplicating initialization logic across `tools.py` and `agent.py`. This directly addresses the separation of concerns feedback from the previous project.
+
+**Progressive search fallback** — the initial single retry dropping all filters was replaced with a 4-step progressive relaxation via `_search_with_fallback`, extracted as a separate helper function following the separation of concerns feedback. The number of fallback attempts is controlled by `MAX_SEARCH_FALLBACKS` (default 4) — making the fallback behavior explicitly configurable and independently testable. This also implements the retry logic with fallback stretch feature.
 
 ---
 
@@ -146,5 +155,5 @@ I gave Claude the Planning Loop and State Management sections of planning.md alo
 **Instance 3 — Resolving the `max_price` inclusive vs exclusive cap and switching to LLM parsing:**
 During a planning discussion, the initial spec described `max_price` as an exclusive cap. Claude flagged a conflict with the provided test (`assert all(item["price"] <= 10 for item in results)`), which expects inclusive behavior. The resolution was to use an inclusive cap in the tool and handle "under $30" at query parsing time by converting it to 29.99. Query parsing was initially implemented with regex, but after identifying that regex required anticipating every possible phrasing, it was switched to LLM parsing. Testing then revealed that "$50 or under" was incorrectly treated as exclusive — the prompt rules were updated to explicitly list inclusive phrasings. Both planning.md and the implementation were updated to reflect these decisions.
 
-**Instance 4 — Adding `NONE` grounding and per-tool retry loops:**
-During implementation, it was identified that the retry conditions for `suggest_outfit` and `create_fit_card` only checked for empty or whitespace output — the LLM could return unhelpful text like "I don't know" that would pass the check but be useless. Rather than checking for refusal phrases after the fact, a `'NONE'` grounding instruction was added to both prompts so the LLM signals failure explicitly. The agent's retry loops were updated to check for `'NONE'` alongside empty strings. `search_listings` was given a single retry with relaxed filters rather than a loop since it's deterministic — retrying with the same inputs would always return the same result. `session["calls"]` was also added to track per-tool call counts for debugging.
+**Instance 4 — Adding `NONE` grounding, per-tool retry loops, and progressive search fallback:**
+During implementation, it was identified that the retry conditions for `suggest_outfit` and `create_fit_card` only checked for empty or whitespace output — the LLM could return unhelpful text like "I don't know" that would pass the check but be useless. Rather than checking for refusal phrases after the fact, a `'NONE'` grounding instruction was added to both prompts so the LLM signals failure explicitly. The agent's retry loops were updated to check for `'NONE'` alongside empty strings. The initial single retry for `search_listings` dropping all filters was also replaced with a 4-step progressive relaxation via `_search_with_fallback` — first relaxing price by 20%, then dropping price, then dropping size — extracted as a separate helper following the separation of concerns feedback from the previous project. `MAX_SEARCH_FALLBACKS` was added as a configurable constant controlling how aggressively the agent relaxes filters, and `session["calls"]` was added to track per-tool call counts for debugging.

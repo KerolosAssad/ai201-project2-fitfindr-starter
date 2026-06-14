@@ -2,6 +2,7 @@
 from tools import search_listings, suggest_outfit, create_fit_card
 from utils.data_loader import get_empty_wardrobe, get_example_wardrobe
 from agent import _parse_query, run_agent
+import agent
 
 
 # ── search_listings tests ─────────────────────────────────────────────────────
@@ -82,3 +83,30 @@ def test_session_calls_tracking():
     assert session["calls"]["search_listings"] >= 1
     assert session["calls"]["suggest_outfit"] >= 1
     assert session["calls"]["create_fit_card"] >= 1
+
+
+# ── MAX_SEARCH_FALLBACKS tests ────────────────────────────────────────────────
+
+def test_search_fallback_respects_max():
+    # with MAX_SEARCH_FALLBACKS = 1, only one attempt should be made — no relaxation
+    original = agent.MAX_SEARCH_FALLBACKS
+    agent.MAX_SEARCH_FALLBACKS = 1
+    try:
+        session = {"calls": {"search_listings": 0}, "search_note": None}
+        agent._search_with_fallback("vintage tee", "XXS", 1.0, session)
+        assert session["calls"]["search_listings"] == 1
+        assert session["search_note"] is None
+    finally:
+        agent.MAX_SEARCH_FALLBACKS = original
+
+
+def test_search_fallback_sets_note():
+    # with MAX_SEARCH_FALLBACKS = 4, relaxation should happen and note should be set
+    # when filters are too strict to find results on first attempt
+    session = {"calls": {"search_listings": 0}, "search_note": None}
+    results = agent._search_with_fallback("vintage tee", "XXS", 1.0, session)
+    # more than one attempt should have been made since filters were too strict
+    assert session["calls"]["search_listings"] > 1
+    # if results were found via fallback, note should be set
+    if results:
+        assert session["search_note"] is not None

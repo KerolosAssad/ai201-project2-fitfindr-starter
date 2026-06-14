@@ -26,7 +26,7 @@ Searches `listings.json` for items matching the user's query and returns the top
 A list of the top 3 matching listing dicts sorted by relevance score (highest first), where each dict contains: `id`, `title`, `description`, `category`, `style_tags`, `size`, `condition`, `price`, `colors`, `brand`, and `platform`. Returns an empty list if nothing matches — does not raise an exception.
 
 **What happens if it fails or returns nothing:**
-The agent retries once with relaxed filters (dropping `size` and `max_price`) before giving up. If the retry also returns empty, the agent stops immediately, does not call `suggest_outfit`, and returns an error message telling the user to broaden their description, adjust their size, or raise their max price.
+The agent retries progressively via `_search_with_fallback` before giving up, up to `MAX_SEARCH_FALLBACKS` (4) attempts. The order is: all filters → relax `max_price` by 20% (staying close to budget) → drop `max_price` entirely → drop `size` as a last resort. The number of fallback attempts is configurable — setting `MAX_SEARCH_FALLBACKS = 1` skips all relaxation. If all attempts return empty, the agent stops immediately, does not call `suggest_outfit`, and returns an error message telling the user to broaden their description, adjust their size, or raise their max price.
 
 ---
 
@@ -70,15 +70,22 @@ If the tool returns nothing or `'NONE'`, the agent retries up to `MAX_ITERATIONS
 
 ---
 
+### Stretch Features
+
+**Retry logic with fallback (implemented):**
+If `search_listings` returns no results, the agent automatically retries with progressively relaxed constraints via `_search_with_fallback`. The order is: all filters → relax `max_price` by 20% → drop `max_price` entirely → drop `size` as a last resort. The number of fallback attempts is controlled by `MAX_SEARCH_FALLBACKS` (default 4) — setting it to 1 disables all relaxation, 2 allows only price relaxation, and so on. Size is preserved as long as possible since a great find at the wrong size is not useful. The user is informed via `session["search_note"]` if filters were relaxed. This directly implements the stretch feature described in the project spec.
+
+---
+
 ## Planning Loop
 
 **How does your agent decide which tool to call next?**
 
 After the user's query is received, the agent first calls `_parse_query()` which uses an LLM to extract `description`, `size`, and `max_price` from the natural language input. The LLM handles exclusive phrasings like "under $30" by subtracting 0.01 (giving 29.99), and inclusive phrasings like "$50 or under" by keeping the number as-is. If the LLM returns malformed JSON, `_parse_query()` falls back to using the full query as the description with no filters.
 
-The agent then calls `search_listings` with the parsed parameters. If results are empty, the agent retries once with relaxed filters (dropping `size` and `max_price`). If the retry also returns empty, the agent sets an error message and returns early — `suggest_outfit` is never called with empty input.
+The agent then calls `_search_with_fallback` which attempts `search_listings` up to `MAX_SEARCH_FALLBACKS` (4) times with progressively relaxed filters: first with all filters, then with `max_price` relaxed by 20% to stay close to the user's budget, then dropping `max_price` entirely while preserving `size`, and finally dropping both filters as a last resort. The number of fallback attempts is configurable — setting `MAX_SEARCH_FALLBACKS = 1` skips all relaxation. If all attempts return empty, the agent sets an error message and returns early — `suggest_outfit` is never called with empty input. Size is preserved as long as possible since a great find at the wrong size is not useful. If a relaxed search succeeds, `session["search_note"]` is set to inform the user which filters were adjusted.
 
-If results are found, the agent sets `selected_item = results[0]` and calls `suggest_outfit`. Since `suggest_outfit` is LLM-based and can fail transiently (network timeout, rate limit) or return `'NONE'` if it cannot generate a valid suggestion, the agent retries up to `MAX_ITERATIONS` (3) times. If all attempts fail, the agent sets an error message and returns early — `create_fit_card` is never called.
+If results are found, the agent sets `selected_item = results[0]` and calls `suggest_outfit`. Since `suggest_outfit` is LLM-based and can fail transiently (network timeout, rate limit) or return `'NONE'`, the agent retries up to `MAX_ITERATIONS` (3) times. If all attempts fail, the agent sets an error message and returns early — `create_fit_card` is never called.
 
 If `suggest_outfit` returns a valid string, the agent calls `create_fit_card`. This is also LLM-based and retries up to `MAX_ITERATIONS` (3) times on failure or `'NONE'` response. If all attempts fail, the agent surfaces the outfit suggestion directly and notes the fit card could not be generated.
 
@@ -100,7 +107,7 @@ For each tool, describe the specific failure mode you're handling and what the a
 
 | Tool | Failure mode | Agent response |
 |------|-------------|----------------|
-| `search_listings` | No results match the query | The agent retries once with relaxed filters (dropping `size` and `max_price`). If the retry also returns empty, the agent stops immediately, does not call `suggest_outfit`, and returns an error message telling the user to broaden their description, adjust their size, or raise their max price. |
+| `search_listings` | No results match the query | The agent retries progressively via `_search_with_fallback` up to `MAX_SEARCH_FALLBACKS` (4) times: first relaxing `max_price` by 20%, then dropping `max_price` entirely, then dropping `size` as a last resort. If all attempts return empty, the agent stops immediately, does not call `suggest_outfit`, and returns an error message telling the user to broaden their description, adjust their size, or raise their max price. |
 | `suggest_outfit` | Wardrobe is empty | The agent does not stop — instead `suggest_outfit` falls back to returning general styling advice for the item rather than specific outfit combinations, and the agent continues to `create_fit_card`. |
 | `create_fit_card` | Outfit input is missing or incomplete | The agent skips the fit card, surfaces the outfit suggestion string from `suggest_outfit` directly to the user, and notes that the fit card could not be generated. |
 
@@ -114,12 +121,16 @@ graph TD
     GetWardrobe -->|Store wardrobe| PlanningLoop[Planning Loop]
     PlanningLoop -->|Call Tool| SearchListings[search_listings]
 
-    SearchListings -->|No Results| RetrySearch[Retry with relaxed filters]
-    RetrySearch -->|Still No Results| ErrorNoMatch[Error: No Listings Match]
+    SearchListings -->|No Results| RetryPrice20[Retry: relax price 20%]
+    RetryPrice20 -->|No Results| RetryDropPrice[Retry: drop price]
+    RetryDropPrice -->|No Results| RetryDropSize[Retry: drop size]
+    RetryDropSize -->|Still No Results| ErrorNoMatch[Error: No Listings Match]
     ErrorNoMatch --> End1[End]
 
     SearchListings -->|Results Found| StoreSelected["selected_item = results[0]"]
-    RetrySearch -->|Results Found| StoreSelected
+    RetryPrice20 -->|Results Found| StoreSelected
+    RetryDropPrice -->|Results Found| StoreSelected
+    RetryDropSize -->|Results Found| StoreSelected
 
     StoreSelected -->|Pass new_item & wardrobe| SuggestOutfit[suggest_outfit]
 
@@ -173,7 +184,7 @@ During implementation, query parsing was initially handled with regex but switch
 
 **Milestone 4 — Planning loop and state management:**
 
-I'll give Claude the Planning Loop and State Management sections of this planning.md along with the agent architecture diagram and ask it to implement the loop in `agent.py`. I'll verify that `selected_item`, `suggestion`, and `fit_card` are correctly passed between tool calls, that all early exit conditions trigger the right error messages, and that per-tool retry loops are in place for LLM-based tools. During implementation, `search_listings` was given a single retry with relaxed filters rather than a loop since it's deterministic — retrying with the same inputs would always return the same result. `suggest_outfit` and `create_fit_card` each got their own `while` loop up to `MAX_ITERATIONS` (3) since LLM calls can fail transiently. `session["calls"]` was added to track how many times each tool was called independently for debugging.
+I'll give Claude the Planning Loop and State Management sections of this planning.md along with the agent architecture diagram and ask it to implement the loop in `agent.py`. I'll verify that `selected_item`, `suggestion`, and `fit_card` are correctly passed between tool calls, that all early exit conditions trigger the right error messages, and that per-tool retry loops are in place for LLM-based tools. During implementation, `search_listings` was refactored into a separate `_search_with_fallback` helper function following the separation of concerns feedback from the previous project — this makes it independently testable and keeps `run_agent()` readable. The retry logic was improved from a single relaxed retry to a progressive 4-step relaxation: all filters → relax price 20% → drop price → drop size. `MAX_SEARCH_FALLBACKS` was also added as a configurable constant controlling how aggressively the agent relaxes search filters — setting it to 1 disables all relaxation while 4 enables all four progressive steps. `suggest_outfit` and `create_fit_card` each got their own `while` loop up to `MAX_ITERATIONS` (3) since LLM calls can fail transiently. `session["calls"]` was added to track how many times each tool was called independently for debugging.
 
 ---
 
@@ -191,4 +202,4 @@ The agent receives 3 matching listings sorted by relevance from Step 1 and picks
 The agent calls `create_fit_card(outfit=<suggest_outfit_result>, new_item=<top_listing>)`, passing both the styling suggestion returned from Step 2 and the top listing from Step 1. The tool formats these into a short caption-style fit card and returns it. If either input is missing or the LLM returns `'NONE'`, the agent retries up to `MAX_ITERATIONS` times before surfacing the outfit suggestion from Step 2 on its own and noting that the card couldn't be generated.
 
 **Final output to user:**
-The agent presents all three outputs together: the top matching listing with its price, condition, and platform; the outfit suggestion with specific styling notes; and the generated fit card caption. If `search_listings` returned nothing at Step 1, even after a retry with relaxed filters, the agent stops there, explains which filters likely caused no matches, and suggests loosening one of them. It does not call `suggest_outfit` with empty input.
+The agent presents all three outputs together: the top matching listing with its price, condition, and platform; the outfit suggestion with specific styling notes; and the generated fit card caption. If `search_listings` returned nothing at Step 1, even after all `MAX_SEARCH_FALLBACKS` progressive retry attempts, the agent stops there, explains which filters likely caused no matches, and suggests loosening one of them. It does not call `suggest_outfit` with empty input.

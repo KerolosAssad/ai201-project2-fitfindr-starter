@@ -50,13 +50,21 @@ def _new_session(query: str, wardrobe: dict) -> dict:
             "suggest_outfit": 0,
             "create_fit_card": 0,
         },
+        "search_note": None,         # set if search filters were relaxed during fallback
     }
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
 
 # max number of tool calls allowed before forcing an exit
-MAX_ITERATIONS = 3 # max attempts per individual tool
+MAX_ITERATIONS = 3 # max attempts per individual LLM tool
+
+# max number of progressive fallback attempts for search_listings
+# 1 = all filters only, no relaxation
+# 2 = all filters → relax price 20%
+# 3 = all filters → relax price 20% → drop price
+# 4 = all filters → relax price 20% → drop price → drop size (most aggressive)
+MAX_SEARCH_FALLBACKS = 4
 
 def _parse_query(query: str) -> dict:
     """
@@ -112,6 +120,44 @@ def _parse_query(query: str) -> dict:
         "size": parsed.get("size", None),
         "max_price": float(parsed["max_price"]) if parsed.get("max_price") is not None else None,
     }
+
+def _search_with_fallback(description: str, size: str | None, max_price: float | None, session: dict) -> list[dict]:
+    """
+    Attempt search_listings with progressively relaxed filters.
+    Order: all filters → relax price 20% → drop price → drop size → empty list.
+    Each attempt is tracked in session["calls"]["search_listings"].
+    """
+    # attempt 1: all filters
+    results = search_listings(description, size, max_price)
+    session["calls"]["search_listings"] += 1
+    if results or MAX_SEARCH_FALLBACKS < 2:
+        return results
+
+    # attempt 2: relax price by 20% — only if max_price was provided
+    if max_price is not None:
+        relaxed_price = max_price * 1.2
+        results = search_listings(description, size, relaxed_price)
+        session["calls"]["search_listings"] += 1
+        if results:
+            session["search_note"] = "No exact matches found — showing items within 20% of your budget."
+        if results or MAX_SEARCH_FALLBACKS < 3:
+            return results
+
+    # attempt 3: drop price entirely — size still preserved
+    results = search_listings(description, size, None)
+    session["calls"]["search_listings"] += 1
+    if results:
+        session["search_note"] = "No exact matches found — price filter removed to find results."
+    if results or MAX_SEARCH_FALLBACKS < 4:
+        return results
+
+    # attempt 4: last resort — drop size too, search on description only
+    results = search_listings(description, None, None)
+    session["calls"]["search_listings"] += 1
+    if results:
+        session["search_note"] = "No exact matches found — size and price filters removed to find results."
+    return results
+
 
 def run_agent(query: str, wardrobe: dict) -> dict:
     """
@@ -169,24 +215,16 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     size = session["parsed"]["size"]
     max_price = session["parsed"]["max_price"]
 
-    # step 3: call search_listings — deterministic, so only retry once
-    # with relaxed filters if the first attempt returns empty
-    session["search_results"] = search_listings(description, size, max_price)
-    session["calls"]["search_listings"] += 1
+    # step 3: call search_listings with progressive filter relaxation
+    # via _search_with_fallback — tries up to 4 times with loosened constraints
+    session["search_results"] = _search_with_fallback(description, size, max_price, session)
 
     if not session["search_results"]:
-        # retry once with relaxed filters — drop size and price since
-        # search_listings is deterministic and retrying with same inputs
-        # would always return the same empty result
-        session["search_results"] = search_listings(description, None, None)
-        session["calls"]["search_listings"] += 1
-
-        if not session["search_results"]:
-            session["error"] = (
-                "No listings matched your query. Try broadening your description, "
-                "adjusting your size, or raising your max price."
-            )
-            return session
+        session["error"] = (
+            "No listings matched your query. Try broadening your description, "
+            "adjusting your size, or raising your max price."
+        )
+        return session
 
     # step 4: select top result
     session["selected_item"] = session["search_results"][0]
@@ -200,7 +238,8 @@ def run_agent(query: str, wardrobe: dict) -> dict:
         session["calls"]["suggest_outfit"] += 1
         outfit_attempts += 1
         if session["outfit_suggestion"] and session["outfit_suggestion"].strip() != "NONE":
-            break
+            break  # valid response — exit loop
+        # NONE or empty — retry
 
     if not session["outfit_suggestion"] or session["outfit_suggestion"].strip() == "NONE":
         session["error"] = (
@@ -217,7 +256,8 @@ def run_agent(query: str, wardrobe: dict) -> dict:
         session["calls"]["create_fit_card"] += 1
         fitcard_attempts += 1
         if session["fit_card"] and session["fit_card"].strip() != "NONE":
-            break
+            break  # valid response — exit loop
+        # NONE or empty — retry
 
     if not session["fit_card"] or session["fit_card"].strip() == "NONE":
         session["error"] = (

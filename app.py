@@ -63,10 +63,11 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         return session["error"], "", ""
 
     # step 5: format selected_item dict into a readable listing_text string
+    # prepend search note if filters were relaxed during fallback search
     item = session["selected_item"]
     listing_text = (
         f"Title: {item['title']}\n"
-        f"Price: ${item['price']}\n"
+        f"Price: ${item['price']:g}\n"
         f"Platform: {item['platform']}\n"
         f"Condition: {item['condition']}\n"
         f"Size: {item['size']}\n"
@@ -75,6 +76,9 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         f"Brand: {item['brand'] if item['brand'] else 'Unbranded'}\n"
         f"Description: {item['description']}"
     )
+
+    if session.get("search_note"):
+        listing_text = f"Note: {session['search_note']}\n\n" + listing_text
 
     return listing_text, session["outfit_suggestion"], session["fit_card"]
 

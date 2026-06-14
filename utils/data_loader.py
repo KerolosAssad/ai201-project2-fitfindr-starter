@@ -6,7 +6,6 @@ the files each time.
 
 import json
 import os
-from typing import Optional
 
 # Resolve the path to the data directory relative to this file
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -31,8 +30,18 @@ def load_listings() -> list[dict]:
         - platform (str): depop, thredUp, or poshmark
     """
     path = os.path.join(_DATA_DIR, "listings.json")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"listings.json not found at {path}. "
+            "Make sure the data directory exists and contains listings.json."
+        )
+    except json.JSONDecodeError:
+        raise ValueError(
+            f"listings.json at {path} is not valid JSON."
+        )
 
 
 def load_wardrobe_schema() -> dict:
@@ -46,8 +55,18 @@ def load_wardrobe_schema() -> dict:
         - empty_wardrobe: a starting template for a new user
     """
     path = os.path.join(_DATA_DIR, "wardrobe_schema.json")
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"wardrobe_schema.json not found at {path}. "
+            "Make sure the data directory exists and contains wardrobe_schema.json."
+        )
+    except json.JSONDecodeError:
+        raise ValueError(
+            f"wardrobe_schema.json at {path} is not valid JSON."
+        )
 
 
 def get_example_wardrobe() -> dict:
