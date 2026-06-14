@@ -12,28 +12,10 @@ Tools:
     create_fit_card(outfit, new_item)               → str
 """
 
-import os
-
-from dotenv import load_dotenv
-from groq import Groq
-
-from utils.data_loader import load_listings
-
 import re
 
-load_dotenv()
-
-
-# ── Groq client ───────────────────────────────────────────────────────────────
-
-def _get_groq_client():
-    """Initialize and return a Groq client using GROQ_API_KEY from .env."""
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "GROQ_API_KEY not set. Add it to a .env file in the project root."
-        )
-    return Groq(api_key=api_key)
+from utils.data_loader import load_listings
+from utils.groq_client import get_groq_client
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -122,11 +104,12 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
         A non-empty string with outfit suggestions.
         If the wardrobe is empty, offer general styling advice for the item
         rather than raising an exception or returning an empty string.
+        Returns 'NONE' if the LLM cannot generate a valid suggestion.
 
     TODO:
         1. Check whether wardrobe['items'] is empty.
         2. If empty: call the LLM with a prompt for general styling ideas
-           (what kinds of items pair well, what vibe it suits, etc.).
+           (what kinds of pieces pair well, what vibe it suits, etc.).
         3. If not empty: format the wardrobe items into a prompt and ask
            the LLM to suggest specific outfit combinations using the new item
            and named pieces from the wardrobe.
@@ -134,7 +117,7 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    client = _get_groq_client()
+    client = get_groq_client()
     items = wardrobe.get("items", [])
 
     # step 1: check whether wardrobe['items'] is empty
@@ -149,7 +132,9 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
             f"  Colors: {', '.join(new_item['colors'])}\n\n"
             f"They haven't shared their wardrobe. Give them 1-2 general outfit "
             f"ideas — what kinds of pieces pair well with this item, what vibe "
-            f"it suits, and any simple styling tips."
+            f"it suits, and any simple styling tips.\n"
+            f"If you cannot generate a valid outfit suggestion for any reason, "
+            f"return only the word 'NONE' and nothing else."
         )
     else:
         # step 3: format wardrobe items into a readable list for the prompt
@@ -170,16 +155,23 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
             f"Their current wardrobe includes:\n{wardrobe_lines}\n\n"
             f"Suggest 1-2 complete outfit combinations using the new item and "
             f"specific pieces from their wardrobe. Be specific about which pieces "
-            f"to pair and include a brief styling tip for each outfit."
+            f"to pair and include a brief styling tip for each outfit.\n"
+            f"If you cannot generate a valid outfit suggestion for any reason, "
+            f"return only the word 'NONE' and nothing else."
         )
 
     # step 4: call the LLM and return the response as a string
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1000,
-    )
-    return response.choices[0].message.content
+    # wrapped in try/except so network timeouts or rate limits return
+    # a meaningful string rather than crashing the agent
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1000,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return "NONE"
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -193,9 +185,10 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
         new_item: The listing dict for the thrifted item.
 
     Returns:
-        A 2–4 sentence string usable as an Instagram/TikTok caption.
+        A 2–4 sentence string usable as a social media caption.
         If outfit is empty or missing, return a descriptive error message
         string — do NOT raise an exception.
+        Returns 'NONE' if the LLM cannot generate a valid caption.
 
     The caption should:
     - Feel casual and authentic (like a real OOTD post, not a product description)
@@ -218,14 +211,14 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
             "Try resubmitting your query with more details."
         )
 
-    client = _get_groq_client()
+    client = get_groq_client()
 
     # step 2: build a prompt with item details and outfit suggestion,
     # asking for a casual caption that mentions name, price, and platform once each
     prompt = (
         f"Write a 2-4 sentence casual social media caption for this outfit.\n\n"
         f"Thrifted item: {new_item['title']}\n"
-        f"Price: ${new_item['price']}\n"
+        f"Price: ${new_item['price']:g}\n"
         f"Platform: {new_item['platform']}\n"
         f"Condition: {new_item['condition']}\n\n"
         f"Outfit details: {outfit}\n\n"
@@ -234,15 +227,22 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
         f"- Mention the item name, price, and platform naturally, once each\n"
         f"- Capture the outfit vibe in specific terms\n"
         f"- Not sound like a product description or advertisement\n"
-        f"Return only the caption, no extra commentary."
+        f"Return only the caption, no extra commentary.\n"
+        f"If you cannot generate a valid caption for any reason, "
+        f"return only the word 'NONE' and nothing else."
     )
 
     # step 3: call the LLM with higher temperature so output
     # varies across runs for the same input
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1000,
-        temperature=1.2,
-    )
-    return response.choices[0].message.content
+    # wrapped in try/except so network timeouts or rate limits return
+    # a meaningful string rather than crashing the agent
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1000,
+            temperature=1.2,
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return "NONE"
